@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+#
+# claude-profiles - Manage multiple Claude configuration profiles
+#
+# Profiles are stored in ~/.claude-profiles/<profile-name>/
+# Each repo can have a .claude/profile file specifying which profile to use
+#
+
+set -e
+
+PROFILES_DIR="${HOME}/.claude-profiles"
+DEFAULT_CLAUDE_CONFIG="${HOME}/.claude"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+usage() {
+    cat <<'EOF'
+Usage: claude-profiles <command> [options]
+
+Commands:
+    install                 Install shell integration to .bashrc/.zshrc
+    uninstall               Remove shell integration from .bashrc/.zshrc
+    list                    List all available profiles
+    create <name>           Create a new profile
+    delete <name>           Delete a profile
+    use <name>              Set the profile for the current repo
+    current                 Show the current repo's profile
+    env                     Print export command for current profile
+    dir                     Print config directory path for current profile
+
+Examples:
+    # Create profiles
+    claude-profiles create work
+    claude-profiles create personal
+
+    # In a repo, set which profile to use
+    cd ~/work/project
+    claude-profiles use work
+    claude                       # automatically uses work profile
+
+EOF
+}
+
+# Find the repo root by looking for .git directory
+find_repo_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    # No git repo found, use current directory
+    echo "$PWD"
+}
+
+# Get the profile for the current repo
+get_current_profile() {
+    local repo_root
+    repo_root="$(find_repo_root)"
+    local profile_file="$repo_root/.claude/profile"
+
+    if [[ -f "$profile_file" ]]; then
+        cat "$profile_file"
+    else
+        echo ""
+    fi
+}
+
+# Get the config dir for a profile
+get_profile_dir() {
+    local profile="$1"
+    if [[ -z "$profile" ]]; then
+        echo "$DEFAULT_CLAUDE_CONFIG"
+    else
+        echo "$PROFILES_DIR/$profile"
+    fi
+}
+
+# Ensure profiles directory exists (called automatically)
+ensure_profiles_dir() {
+    [[ -d "$PROFILES_DIR" ]] || mkdir -p "$PROFILES_DIR"
+}
+
+get_shell_rc() {
+    if [[ -n "${ZSH_VERSION:-}" || "$SHELL" == */zsh ]]; then
+        echo "$HOME/.zshrc"
+    else
+        echo "$HOME/.bashrc"
+    fi
+}
+
+cmd_install() {
+    ensure_profiles_dir
+
+    local shell_rc
+    shell_rc="$(get_shell_rc)"
+
+    if [[ -f "$shell_rc" ]] && grep -q "claude-profiles: shell integration" "$shell_rc" 2>/dev/null; then
+        echo -e "${YELLOW}Shell integration already in $shell_rc${NC}" >&2
+    else
+        cat >> "$shell_rc" << 'SHELL_INTEGRATION'
+
+# claude-profiles:
+claude() {
+    if command -v claude-profiles &>/dev/null; then
+        CLAUDE_CONFIG_DIR="$(claude-profiles dir)" command claude "$@"
+    else
+        command claude "$@"
+    fi
+}
+SHELL_INTEGRATION
+        echo -e "${GREEN}Added shell integration to $shell_rc${NC}" >&2
+    fi
+}
+
+cmd_uninstall() {
+    local shell_rc
+    shell_rc="$(get_shell_rc)"
+
+    if [[ ! -f "$shell_rc" ]]; then
+        echo -e "${YELLOW}No $shell_rc found${NC}"
+        return 0
+    fi
+
+    if ! grep -q "claude-profiles: shell integration" "$shell_rc" 2>/dev/null; then
+        echo -e "${YELLOW}Shell integration not found in $shell_rc${NC}"
+        return 0
+    fi
+
+    # Remove the integration block (from comment to closing brace)
+    sed -i.bak '/# claude-profiles:/,/^}$/d' "$shell_rc"
+    rm -f "${shell_rc}.bak"
+
+    echo -e "${GREEN}Removed shell integration from $shell_rc${NC}"
+}
+
+cmd_list() {
+    ensure_profiles_dir
+
+    local current
+    current="$(get_current_profile)"
+
+    echo -e "${BLUE}Available profiles:${NC}"
+    echo -e "  ${YELLOW}(default)${NC} - $DEFAULT_CLAUDE_CONFIG"
+
+    for profile_path in "$PROFILES_DIR"/*/; do
+        if [[ -d "$profile_path" ]]; then
+            local name
+            name="$(basename "$profile_path")"
+            if [[ "$name" == "$current" ]]; then
+                echo -e "  ${GREEN}* $name${NC} (current)"
+            else
+                echo -e "  $name"
+            fi
+        fi
+    done
+}
+
+cmd_create() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Profile name required${NC}"
+        echo "Usage: claude-profiles create <name>"
+        return 1
+    fi
+
+    # Validate name (alphanumeric, dash, underscore only)
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo -e "${RED}Error: Profile name can only contain letters, numbers, dashes, and underscores${NC}"
+        return 1
+    fi
+
+    ensure_profiles_dir
+    local profile_dir="$PROFILES_DIR/$name"
+
+    if [[ -d "$profile_dir" ]]; then
+        echo -e "${RED}Error: Profile '$name' already exists${NC}"
+        return 1
+    fi
+
+    mkdir -p "$profile_dir"
+    echo -e "${GREEN}Created profile: $name${NC}"
+    echo -e "Profile directory: $profile_dir"
+}
+
+cmd_delete() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Profile name required${NC}"
+        echo "Usage: claude-profiles delete <name>"
+        return 1
+    fi
+
+    local profile_dir="$PROFILES_DIR/$name"
+
+    if [[ ! -d "$profile_dir" ]]; then
+        echo -e "${RED}Error: Profile '$name' does not exist${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}This will delete the profile '$name' and all its configuration.${NC}"
+    read -p "Are you sure? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf "$profile_dir"
+        echo -e "${GREEN}Deleted profile: $name${NC}"
+    else
+        echo "Cancelled."
+    fi
+}
+
+cmd_use() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Error: Profile name required${NC}"
+        echo "Usage: claude-profiles use <name>"
+        return 1
+    fi
+
+    # Allow "default" to clear the profile
+    if [[ "$name" != "default" ]]; then
+        local profile_dir="$PROFILES_DIR/$name"
+        if [[ ! -d "$profile_dir" ]]; then
+            echo -e "${RED}Error: Profile '$name' does not exist${NC}"
+            echo "Run 'claude-profiles list' to see available profiles"
+            return 1
+        fi
+    fi
+
+    local repo_root
+    repo_root="$(find_repo_root)"
+    local claude_dir="$repo_root/.claude"
+    local profile_file="$claude_dir/profile"
+
+    mkdir -p "$claude_dir"
+
+    if [[ "$name" == "default" ]]; then
+        rm -f "$profile_file"
+        echo -e "${GREEN}Cleared profile for this repo (using default)${NC}"
+    else
+        echo "$name" > "$profile_file"
+        echo -e "${GREEN}Set profile for this repo: $name${NC}"
+    fi
+
+    # Remind user about .gitignore
+    local gitignore="$repo_root/.gitignore"
+    if [[ -f "$gitignore" ]]; then
+        if ! grep -q "^\.claude/profile$" "$gitignore" 2>/dev/null; then
+            echo -e "${YELLOW}Tip: Consider adding '.claude/profile' to .gitignore${NC}"
+        fi
+    fi
+}
+
+cmd_current() {
+    local profile
+    profile="$(get_current_profile)"
+
+    if [[ -z "$profile" ]]; then
+        echo -e "Current profile: ${YELLOW}(default)${NC}"
+        echo "Config directory: $DEFAULT_CLAUDE_CONFIG"
+    else
+        local profile_dir
+        profile_dir="$(get_profile_dir "$profile")"
+        echo -e "Current profile: ${GREEN}$profile${NC}"
+        echo "Config directory: $profile_dir"
+    fi
+}
+
+cmd_env() {
+    local profile
+    profile="$(get_current_profile)"
+    local profile_dir
+    profile_dir="$(get_profile_dir "$profile")"
+
+    echo "export CLAUDE_CONFIG_DIR=\"$profile_dir\""
+}
+
+cmd_dir() {
+    local profile
+    profile="$(get_current_profile)"
+    get_profile_dir "$profile"
+}
+
+
+# Main command dispatcher
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        list|ls)
+            cmd_list
+            ;;
+        create|new)
+            cmd_create "$@"
+            ;;
+        delete|rm)
+            cmd_delete "$@"
+            ;;
+        use|set)
+            cmd_use "$@"
+            ;;
+        current|show)
+            cmd_current
+            ;;
+        env)
+            cmd_env
+            ;;
+        dir)
+            cmd_dir
+            ;;
+        install)
+            cmd_install
+            ;;
+        uninstall)
+            cmd_uninstall
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        "")
+            usage
+            return 1
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            usage
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
